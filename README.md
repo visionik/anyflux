@@ -27,7 +27,7 @@ AnyFlux is a **filter graph** and **flow-based programming (FBP)** library desig
 ### Design Philosophy
 
 - **Native-first**: Each language has a fully idiomatic API while sharing identical core concepts.
-- **Dual data paths**: Typed ports for performance + `Variant` for cross-language interop.
+- **Dual data paths**: Typed ports for performance + [`AVar`](https://github.com/visionik/anyvar) ([AnyVar](https://github.com/visionik/anyvar)) for cross-language interop.
 - **FBP Protocol compatible**: Optional thin layer for visual editors (Flowhub) and testing (fbp-spec).
 - **Separate concerns**: Execution core vs. control/visual layer.
 
@@ -51,7 +51,7 @@ graph TB
 
     subgraph "Data Layer"
         TP[Typed Packets<br/>zero-copy, native]
-        VP[Variant Packets<br/>cross-language, dynamic]
+        VP[AVar Packets<br/>cross-language, dynamic]
     end
 
     subgraph "Platform Layer"
@@ -98,13 +98,13 @@ erDiagram
 The unit of data that flows through the graph.
 
 - **Typed Packet** (`Packet<T>` or native type): For same-language, high-performance paths (zero-copy where possible).
-- **Variant Packet**: Cross-language / dynamic data.
+- **AVar Packet** ([AnyVar](https://github.com/visionik/anyvar)): Cross-language / dynamic data.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    subgraph "Variant Types"
-        V[Variant]
+    subgraph "AVar Types  github.com/visionik/anyvar"
+        V[AVar]
         V --> N[null]
         V --> B[bool]
         V --> I[int64]
@@ -127,42 +127,41 @@ graph LR
     V -.-> AH
 ```
 
-**Variant Specification (C ABI friendly):**
+**AnyFlux uses [AnyVar](https://github.com/visionik/anyvar) (`AVar`) as its canonical cross-language variant type:**
 
 ```c
-typedef enum {
-    VF_NULL,
-    VF_BOOL,
-    VF_INT64,
-    VF_DOUBLE,
-    VF_STRING,
-    VF_BINARY,
-    VF_ARRAY,
-    VF_MAP,
-    // ... extensions
-} VariantType;
+/* AVar — from github.com/visionik/anyvar
+ * See full C ABI, ownership rules, and language bindings at:
+ * https://github.com/visionik/anyvar
+ */
+typedef enum AVarType {
+    A_NULL = 0, A_BOOL = 1, A_INT64 = 2, A_DOUBLE = 3,
+    A_STRING = 4, A_BINARY = 5, A_ARRAY = 6, A_MAP = 7,
+    A_CUSTOM = 255
+} AVarType;
 
-typedef struct {
-    VariantType type;
+typedef struct AVar {
+    AVarType type;
     union {
-        bool b;
-        int64_t i64;
-        double dbl;
-        struct { char* ptr; size_t len; bool owned; } str;
-        // array and map use external pointers + length + ownership
+        bool          b;
+        int64_t       i64;
+        double        d;
+        struct { char* data; size_t len; bool owned; } str;
+        struct { struct AVar* items; size_t len; } array;
+        struct { struct AVar* keys; struct AVar* values; size_t len; } map;
+        void*         custom;
     } u;
-    // optional: metadata pointer, refcount
-} Variant;
+} AVar;
 ```
 
-> Conversion helpers to/from native types in each language binding.
-> Fast path: Bypass Variant when types match and same language/process.
+> See the [AnyVar specification](https://github.com/visionik/anyvar) for the full C ABI definition, ownership model, and idiomatic language bindings.
+> Fast path: Bypass `AVar` when types match and remain within the same language/process.
 
 ### 2.2 Ports
 
 - **InPort** and **OutPort** — named (e.g., `"data"`, `"error"`).
 - Support single ports and array ports (fan-in/fan-out).
-- Typed or Variant mode.
+- Typed or `AVar` mode.
 - Pull-based interface (inspired by RAMEN) for embedded/low-overhead use: `Puller<T>` / `Pullable<T>`.
 
 ### 2.3 Component / Node
@@ -491,7 +490,7 @@ mindmap
 - Static allocation pools for packets and nodes.
 - Lightweight JSON parser for protocol (e.g., jsmn).
 - Pull-based execution to minimize queues and context switches.
-- Allocator hooks for Variant.
+- Allocator hooks for `AVar` (see [AnyVar](https://github.com/visionik/anyvar)).
 
 ### Desktop vs Embedded Feature Matrix
 
@@ -502,7 +501,7 @@ mindmap
 | JSON parser | Full (nlohmann, etc.) | Minimal (jsmn) |
 | Exceptions | Yes | Optional (compile flag) |
 | RTTI | Yes | Optional (compile flag) |
-| Variant ownership | Refcount | Move-only or static |
+| `AVar` ownership | Refcount | Move-only or static |
 | Protocol transport | WebSocket | Serial/UART |
 | Graph modification | Runtime | Compile-time preferred |
 
@@ -518,7 +517,7 @@ gantt
     axisFormat %b %Y
 
     section Phase 1: Core
-    Packet/Variant + Ports          :p1a, 2026-05, 4w
+    Packet/AVar + Ports             :p1a, 2026-05, 4w
     Component + Graph               :p1b, after p1a, 3w
     Single-threaded Scheduler       :p1c, after p1b, 2w
 
@@ -552,7 +551,7 @@ gantt
 
 | Phase | Deliverables | Dependencies |
 |---|---|---|
-| **1. Core** | Packet/Variant, Ports, Component, Graph, single-threaded Scheduler | None |
+| **1. Core** | Packet/[AVar](https://github.com/visionik/anyvar), Ports, Component, Graph, single-threaded Scheduler | None |
 | **2. Serialization** | JSON graph load/save, fluent builders | Phase 1 |
 | **3. Execution** | Typed + Variant execution paths, back-pressure | Phase 2 |
 | **4. Schedulers** | Pluggable schedulers (desktop vs embedded) | Phase 3 |
@@ -578,4 +577,10 @@ AnyFlux is intended to be open source (**MIT/Apache 2.0** recommended) to encour
 
 > This specification defines the shared foundation. Each language implementation must support the core concepts while providing native, idiomatic APIs. The FBP Protocol layer is optional but strongly recommended for visual tooling and ecosystem compatibility.
 >
-> **Feedback and contributions welcome.** Next steps: formalize Variant serialization, define exact component metadata schema, and prototype the C++ core.
+> **Feedback and contributions welcome.** Next steps: formalize `AVar` serialization (see [AnyVar](https://github.com/visionik/anyvar)), define exact component metadata schema, and prototype the C++ core.
+
+---
+
+## 13. Related Projects
+
+- **[AnyVar](https://github.com/visionik/anyvar)** — The canonical cross-language, C-ABI-compatible tagged union (`AVar`) used as AnyFlux's variant packet type. Defines the full type system, ownership model, C ABI layout, and language binding conventions.
