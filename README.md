@@ -104,7 +104,7 @@ The unit of data that flows through the graph.
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
     subgraph "AVar Types  github.com/visionik/anyvar"
-        V[AVar]
+        V["AVar<br/><i>fat pointer handle</i>"]
         V --> N[null]
         V --> B[bool]
         V --> I[int64]
@@ -113,49 +113,67 @@ graph LR
         V --> BN[binary]
         V --> A[array]
         V --> M[map / object]
-        V --> X[extensions]
+        V --> X[custom/extensions]
+    end
+
+    subgraph "Backends"
+        NB["Default<br/>AVarNative"]
+        CB["CBOR"]
+        JB["JSON"]
+        XB["Custom<br/>ABackend impl"]
     end
 
     subgraph "Ownership"
         MV[Move]
         RC[Refcount]
-        AH[Allocator Hooks<br/>for embedded]
+        AH["Allocator Hooks<br/>A_NO_HEAP / A_PACKED"]
     end
 
+    V -.-> NB
+    V -.-> CB
+    V -.-> JB
+    V -.-> XB
     V -.-> MV
     V -.-> RC
     V -.-> AH
 ```
 
-**AnyFlux uses [AnyVar](https://github.com/visionik/anyvar) (`AVar`) as its canonical cross-language variant type:**
+**AnyFlux uses [AnyVar](https://github.com/visionik/anyvar) v0.2 (`AVar`) as its canonical cross-language variant type.**
+
+As of v0.2, `AVar` is a **fat pointer** (16 bytes on 64-bit): a `_backend` vtable pointer + opaque `_storage`. The default backend (`AVAR_DEFAULT_BACKEND`) is selected automatically on zero-initialisation — no extra parameters required. The original tagged union layout is now `AVarNative`, the internal representation of the default backend.
 
 ```c
-/* AVar — from github.com/visionik/anyvar
- * See full C ABI, ownership rules, and language bindings at:
- * https://github.com/visionik/anyvar
+/* AVar — universal fat-pointer handle (from github.com/visionik/anyvar v0.2)
+ * Zero-initialise and call any a_var_set_*(); default backend selected automatically.
+ * Never access _backend or _storage directly.
  */
-typedef enum AVarType {
-    A_NULL = 0, A_BOOL = 1, A_INT64 = 2, A_DOUBLE = 3,
-    A_STRING = 4, A_BINARY = 5, A_ARRAY = 6, A_MAP = 7,
-    A_CUSTOM = 255
-} AVarType;
-
 typedef struct AVar {
-    AVarType type;
+    const ABackend* _backend;   /* NULL → AVAR_DEFAULT_BACKEND auto-selected */
     union {
-        bool          b;
-        int64_t       i64;
-        double        d;
-        struct { char* data; size_t len; bool owned; } str;
-        struct { struct AVar* items; size_t len; } array;
-        struct { struct AVar* keys; struct AVar* values; size_t len; } map;
-        void*         custom;
-    } u;
+        void*   _ptr;           /* heap-allocated backend data               */
+        int64_t _i64;           /* inline scalar                             */
+        double  _d;             /* inline scalar                             */
+        uint8_t _buf[8];        /* small inline buffer                       */
+    } _storage;
 } AVar;
+
+/* Built-in backends */
+extern const ABackend AVAR_DEFAULT_BACKEND;  /* native C struct (AVarNative) */
+extern const ABackend AVAR_CBOR_BACKEND;
+extern const ABackend AVAR_JSON_BACKEND;
+
+/* Usage — default backend, no extra params: */
+AVar v = {0};
+a_var_set_i64(&v, 42);
+a_var_clear(&v);
+
+/* Explicit backend (advanced): */
+AVar v2;
+a_var_init_with_backend(&v2, &AVAR_CBOR_BACKEND);
 ```
 
-> See the [AnyVar specification](https://github.com/visionik/anyvar) for the full C ABI definition, ownership model, and idiomatic language bindings.
-> Fast path: Bypass `AVar` when types match and remain within the same language/process.
+> See the [AnyVar specification](https://github.com/visionik/anyvar) for the full `ABackend` vtable, `AVarNative` internal layout, ownership model, and language bindings.
+> Fast path: Bypass `AVar` entirely when types match and remain within the same language/process.
 
 ### 2.2 Ports
 
@@ -490,7 +508,15 @@ mindmap
 - Static allocation pools for packets and nodes.
 - Lightweight JSON parser for protocol (e.g., jsmn).
 - Pull-based execution to minimize queues and context switches.
-- Allocator hooks for `AVar` (see [AnyVar](https://github.com/visionik/anyvar)).
+- `AVar` compile-time flags for embedded targets (defined in [AnyVar](https://github.com/visionik/anyvar)):
+
+| Flag | Effect |
+|---|---|
+| `A_NO_HEAP` | Disable heap allocation; use static pools only |
+| `A_PACKED` | Apply struct packing for minimal `AVarNative` size |
+| `A_TYPE_U8` | Use `uint8_t` for `AVarType` instead of `uint32_t` |
+| `A_CUSTOM_ALLOC` | Enable custom allocator hooks |
+| `A_NO_MAP` | Disable `A_MAP` type (saves code size on tiny targets) |
 
 ### Desktop vs Embedded Feature Matrix
 
@@ -526,7 +552,7 @@ gantt
     Fluent builder APIs             :p2b, after p1c, 2w
 
     section Phase 3: Execution
-    Typed + Variant dual paths      :p3a, after p2a, 3w
+    Typed + AVar dual paths         :p3a, after p2a, 3w
     Back-pressure                   :p3b, after p3a, 2w
 
     section Phase 4: Schedulers
@@ -553,7 +579,7 @@ gantt
 |---|---|---|
 | **1. Core** | Packet/[AVar](https://github.com/visionik/anyvar), Ports, Component, Graph, single-threaded Scheduler | None |
 | **2. Serialization** | JSON graph load/save, fluent builders | Phase 1 |
-| **3. Execution** | Typed + Variant execution paths, back-pressure | Phase 2 |
+| **3. Execution** | Typed + AVar execution paths, back-pressure | Phase 2 |
 | **4. Schedulers** | Pluggable schedulers (desktop vs embedded) | Phase 3 |
 | **5. Protocol** | Minimal FBP Protocol adapter + test components | Phase 4 |
 | **6. Polish** | Live monitoring, hierarchical graphs, dynamic registration | Phase 5 |
@@ -583,4 +609,4 @@ AnyFlux is intended to be open source (**MIT/Apache 2.0** recommended) to encour
 
 ## 13. Related Projects
 
-- **[AnyVar](https://github.com/visionik/anyvar)** — The canonical cross-language, C-ABI-compatible tagged union (`AVar`) used as AnyFlux's variant packet type. Defines the full type system, ownership model, C ABI layout, and language binding conventions.
+- **[AnyVar](https://github.com/visionik/anyvar)** — The canonical cross-language, C-ABI-compatible variant type (`AVar`) used as AnyFlux's variant packet type. As of v0.2, `AVar` is a fat-pointer handle dispatching through a pluggable `ABackend` vtable; the original tagged union layout is `AVarNative` (default backend). Defines the full type system, ownership model, CBOR/JSON serialization backends, embedded compile flags, and language binding conventions.
