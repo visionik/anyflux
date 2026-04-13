@@ -113,9 +113,8 @@ static AFStatus src_a_process(AFComponent comp, const char* in,
 {
     (void)in; (void)pkt;
     AdderState* s = ud;
-    s->a = read_sensor_a();     /* native double — no AVar involved */
-    AVar trigger = {0};         /* A_NULL trigger — carries no data */
-    aFlux_componentEmit(comp, "out", &trigger);
+    s->a = read_sensor_a();          /* native double — no AVar involved */
+    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
     return AF_OK;
 }
 
@@ -123,15 +122,14 @@ static AFStatus src_a_process(AFComponent comp, const char* in,
 static AFStatus adder_process(AFComponent comp, const char* inport,
                                const AVar* pkt, void* ud)
 {
-    (void)pkt;                  /* trigger carries no data — ignore it */
+    (void)pkt;                       /* trigger carries no data — ignore it */
     AdderState* s = ud;
     if      (strcmp(inport, "a") == 0) s->has_a = true;
     else if (strcmp(inport, "b") == 0) s->has_b = true;
     if (!s->has_a || !s->has_b) return AF_OK;
-    s->result  = s->a + s->b;  /* native arithmetic on shared state */
+    s->result  = s->a + s->b;        /* native arithmetic on shared state */
     s->has_a   = s->has_b = false;
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, "out", &trigger);
+    aFlux_componentEmit(comp, "out", NULL);
     return AF_OK;
 }
 ```
@@ -338,18 +336,17 @@ static AFStatus source_process(AFComponent comp, const char* in,
 {
     (void)in; (void)pkt;
     CounterState* s = (CounterState*)ud;
-    s->count++;                        /* write native data to shared state */
-    AVar trigger = {0};                /* A_NULL trigger — no data in packet */
-    aFlux_componentEmit(comp, "out", &trigger);
+    s->count++;                              /* write native int to shared state */
+    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
     return AF_OK;
 }
 
 static AFStatus printer_process(AFComponent comp, const char* in,
                                  const AVar* pkt, void* ud)
 {
-    (void)comp; (void)in; (void)pkt;   /* packet ignored — data is in shared state */
+    (void)comp; (void)in; (void)pkt;         /* trigger ignored — data is in shared state */
     CounterState* s = (CounterState*)ud;
-    printf("count: %d\n", s->count);  /* read native data directly */
+    printf("count: %d\n", s->count);        /* read native int directly */
     return AF_OK;
 }
 
@@ -410,9 +407,8 @@ static AFStatus src_a_process(AFComponent comp, const char* in,
 {
     (void)in; (void)pkt;
     AdderState* s = (AdderState*)ud;
-    s->a = read_sensor_a();            /* native double — no AVar */
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, "out", &trigger);
+    s->a = read_sensor_a();                  /* native double — no AVar */
+    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger */
     return AF_OK;
 }
 
@@ -422,26 +418,24 @@ static AFStatus src_b_process(AFComponent comp, const char* in,
     (void)in; (void)pkt;
     AdderState* s = (AdderState*)ud;
     s->b = read_sensor_b();
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, "out", &trigger);
+    aFlux_componentEmit(comp, "out", NULL);
     return AF_OK;
 }
 
 static AFStatus adder_process(AFComponent comp, const char* inport,
                                const AVar* pkt, void* ud)
 {
-    (void)pkt;                         /* trigger carries no data */
+    (void)pkt;                               /* trigger carries no data */
     AdderState* s = (AdderState*)ud;
     if      (strcmp(inport, "a") == 0) s->has_a = true;
     else if (strcmp(inport, "b") == 0) s->has_b = true;
     if (!s->has_a || !s->has_b) return AF_OK;
 
-    s->result   = s->a + s->b;         /* native arithmetic on shared state */
+    s->result   = s->a + s->b;               /* native arithmetic on shared state */
     s->overflow = s->result > 1e6;
     s->has_a = s->has_b = false;
 
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, s->overflow ? "err" : "out", &trigger);
+    aFlux_componentEmit(comp, s->overflow ? "err" : "out", NULL);
     return AF_OK;
 }
 
@@ -450,7 +444,7 @@ static AFStatus sink_process(AFComponent comp, const char* in,
 {
     (void)comp; (void)in; (void)pkt;
     AdderState* s = (AdderState*)ud;
-    printf("result: %f\n", s->result); /* read native result directly */
+    printf("result: %f\n", s->result);       /* read native double directly */
     return AF_OK;
 }
 ```
@@ -485,8 +479,7 @@ static AFStatus source_process(AFComponent comp, const char* in,
     DSPState* s = (DSPState*)ud;
     for (size_t i = 0; i < s->len; i++)
         s->buf[i] = sinf((float)i * 0.1f);  /* fill native float buffer */
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, "out", &trigger);
+    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
     return AF_OK;
 }
 
@@ -495,10 +488,9 @@ static AFStatus lowpass_process(AFComponent comp, const char* in,
 {
     (void)in; (void)pkt;
     DSPState* s = (DSPState*)ud;
-    for (size_t i = 1; i < s->len; i++)     /* in-place filter on native floats */
+    for (size_t i = 1; i < s->len; i++)      /* in-place filter on native floats */
         s->buf[i] = 0.5f * s->buf[i] + 0.5f * s->buf[i-1];
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, is_clipping(s->buf, s->len) ? "err" : "out", &trigger);
+    aFlux_componentEmit(comp, is_clipping(s->buf, s->len) ? "err" : "out", NULL);
     return AF_OK;
 }
 
@@ -508,9 +500,8 @@ static AFStatus amplifier_process(AFComponent comp, const char* in,
     (void)in; (void)pkt;
     DSPState* s = (DSPState*)ud;
     for (size_t i = 0; i < s->len; i++)
-        s->buf[i] *= s->gain;               /* multiply by native gain */
-    AVar trigger = {0};
-    aFlux_componentEmit(comp, "out", &trigger);
+        s->buf[i] *= s->gain;                /* multiply by native gain */
+    aFlux_componentEmit(comp, "out", NULL);
     return AF_OK;
 }
 
@@ -519,7 +510,7 @@ static AFStatus sink_process(AFComponent comp, const char* in,
 {
     (void)comp; (void)in; (void)pkt;
     DSPState* s = (DSPState*)ud;
-    write_output(s->buf, s->len);           /* write native floats to output */
+    write_output(s->buf, s->len);            /* write native floats to output */
     return AF_OK;
 }
 ```

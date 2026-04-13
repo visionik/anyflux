@@ -296,6 +296,8 @@ AFStatus aFlux_componentEmit(AFComponent comp, const char* outport, const AVar* 
 ```
 Emits `packet` on the named outport. Intended to be called from within `AFProcessFn`.
 The packet is **borrowed** — AnyFlux deep-copies it into the connection buffer.
+Pass `packet = NULL` to send a null trigger (type `A_NULL`) with no data — the receiving
+component's `process` callback fires but carries no payload.
 Returns `AF_OK` if the port is unconnected (silent no-op). Returns `AF_ERR_FULL` if
 back-pressure is active and the buffer is at capacity.
 
