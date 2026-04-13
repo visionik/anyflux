@@ -311,60 +311,55 @@ flowchart TD
 
 ---
 
-Examples 5.1–5.3 use **native C types** only — data flows through shared `userdata` structs
-and packets are null triggers carrying no data. Example 5.4 introduces `AVar` as the
-alternative where data travels IN the packet.
+### 5.1 Simple Two-Component Pipeline
 
-### 5.1 Native: Simple Two-Component Pipeline
-
-Two components share a `CounterState` via `userdata`. The packet is a null trigger — it
-signals "ready" but carries no data.
+A generator emits an integer value via its `out` port; a printer receives it on `in` and
+prints it. This is the basic AnyFlux pattern: data travels through the port connection.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    SRC["Source\nout: out"] -->|"null trigger"| PRT["Printer\nin: in"]
-    SRC <-->|"shared CounterState*"| PRT
+    GEN["Generator\nout: out"] -->|"int value = 42"| PRT["Printer\nin: in"]
 ```
 
 ```c
-typedef struct { int count; } CounterState;
-static CounterState state = {0};
+#include "anyflux.h"
+#include "anyvar.h"
 
-static AFStatus source_process(AFComponent comp, const char* in,
-                                const AVar* pkt, void* ud)
+static AFStatus gen_process(AFComponent comp, const char* in,
+                             const AVar* pkt, void* ud)
 {
-    (void)in; (void)pkt;
-    CounterState* s = (CounterState*)ud;
-    s->count++;                              /* write native int to shared state */
-    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
+    (void)in; (void)pkt; (void)ud;
+    AVar out = {0};
+    aVar_setI32(&out, 42);
+    aFlux_componentEmit(comp, "out", &out);
+    aVar_clear(&out);
     return AF_OK;
 }
 
-static AFStatus printer_process(AFComponent comp, const char* in,
-                                 const AVar* pkt, void* ud)
+static AFStatus print_process(AFComponent comp, const char* in,
+                               const AVar* pkt, void* ud)
 {
-    (void)comp; (void)in; (void)pkt;         /* trigger ignored — data is in shared state */
-    CounterState* s = (CounterState*)ud;
-    printf("count: %d\n", s->count);        /* read native int directly */
+    (void)comp; (void)in; (void)ud;
+    printf("value: %d\n", aVar_asI32(pkt));
     return AF_OK;
 }
 
 int main(void) {
-    static const AFPortMeta src_out[] = {{"out", NULL, NULL, false}};
-    static const AFPortMeta prn_in[]  = {{"in",  NULL, NULL, true }};
+    static const AFPortMeta gen_out[] = {{"out", NULL, "int32", false}};
+    static const AFPortMeta prn_in[]  = {{"in",  NULL, "int32", true }};
 
-    AFComponent src = aFlux_componentCreate(&(AFComponentDesc){
-        .type_name="example/Source", .outport_count=1, .outports=src_out,
-        .process=source_process, .userdata=&state });
+    AFComponent gen = aFlux_componentCreate(&(AFComponentDesc){
+        .type_name="example/Gen", .outport_count=1, .outports=gen_out,
+        .process=gen_process });
     AFComponent prn = aFlux_componentCreate(&(AFComponentDesc){
-        .type_name="example/Printer", .inport_count=1, .inports=prn_in,
-        .process=printer_process, .userdata=&state });
+        .type_name="example/Print", .inport_count=1, .inports=prn_in,
+        .process=print_process });
 
     AFGraph g = aFlux_graphCreate();
-    aFlux_graphAddComponent(g, "src", src);
+    aFlux_graphAddComponent(g, "gen", gen);
     aFlux_graphAddComponent(g, "prn", prn);
-    aFlux_graphConnect(g, "src", "out", "prn", "in");
+    aFlux_graphConnect(g, "gen", "out", "prn", "in");
 
     AFScheduler s = aFlux_schedulerCreateSingleThread();
     aFlux_run(g, s);
