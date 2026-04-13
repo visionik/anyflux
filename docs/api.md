@@ -102,27 +102,41 @@ graph LR
     P --> ERR["outport: err"]
 ```
 
-The callback receives the **name of the inport that fired** so a multi-input component can
-dispatch:
+The callback receives the **name of the inport that fired** so a multi-input component
+can dispatch across its inports. Upstream components write into the shared `userdata` state
+before emitting a trigger; the adder just tracks readiness:
 
 ```c
-static AFStatus adder_process(AFComponent comp, const char* inport,
-                               const AVar* packet, void* userdata)
+/* Upstream sources write to shared state then emit a null trigger */
+static AFStatus src_a_process(AFComponent comp, const char* in,
+                               const AVar* pkt, void* ud)
 {
-    AdderState* s = userdata;
-    if      (strcmp(inport, "a") == 0) { s->a = aVar_asDouble(packet); s->has_a = true; }
-    else if (strcmp(inport, "b") == 0) { s->b = aVar_asDouble(packet); s->has_b = true; }
+    (void)in; (void)pkt;
+    AdderState* s = ud;
+    s->a = read_sensor_a();     /* native double — no AVar involved */
+    AVar trigger = {0};         /* A_NULL trigger — carries no data */
+    aFlux_componentEmit(comp, "out", &trigger);
+    return AF_OK;
+}
 
-    if (s->has_a && s->has_b) {
-        AVar out = {0};
-        aVar_setDouble(&out, s->a + s->b);
-        aFlux_componentEmit(comp, "out", &out);
-        aVar_clear(&out);
-        s->has_a = s->has_b = false;
-    }
+/* Adder fires when both triggers have arrived */
+static AFStatus adder_process(AFComponent comp, const char* inport,
+                               const AVar* pkt, void* ud)
+{
+    (void)pkt;                  /* trigger carries no data — ignore it */
+    AdderState* s = ud;
+    if      (strcmp(inport, "a") == 0) s->has_a = true;
+    else if (strcmp(inport, "b") == 0) s->has_b = true;
+    if (!s->has_a || !s->has_b) return AF_OK;
+    s->result  = s->a + s->b;  /* native arithmetic on shared state */
+    s->has_a   = s->has_b = false;
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, "out", &trigger);
     return AF_OK;
 }
 ```
+
+See §5.4 for using `AVar` to carry data IN the packet instead of through shared state.
 
 ### 3.2 Multiple Ports
 
@@ -299,51 +313,61 @@ flowchart TD
 
 ---
 
-## 5. Examples
+Examples 5.1–5.3 use **native C types** only — data flows through shared `userdata` structs
+and packets are null triggers carrying no data. Example 5.4 introduces `AVar` as the
+alternative where data travels IN the packet.
 
-### 5.1 Simple Two-Component Pipeline
+### 5.1 Native: Simple Two-Component Pipeline
+
+Two components share a `CounterState` via `userdata`. The packet is a null trigger — it
+signals "ready" but carries no data.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    GEN["Generator\nout: out"] -->|"out → in"| PRT["Printer\nin: in"]
+    SRC["Source\nout: out"] -->|"null trigger"| PRT["Printer\nin: in"]
+    SRC <-->|"shared CounterState*"| PRT
 ```
 
 ```c
-static AFStatus gen_process(AFComponent comp, const char* p,
-                             const AVar* pkt, void* ud)
+typedef struct { int count; } CounterState;
+static CounterState state = {0};
+
+static AFStatus source_process(AFComponent comp, const char* in,
+                                const AVar* pkt, void* ud)
 {
-    (void)p; (void)pkt; (void)ud;
-    AVar out = {0};
-    aVar_setI64(&out, 42);
-    aFlux_componentEmit(comp, "out", &out);
-    aVar_clear(&out);
+    (void)in; (void)pkt;
+    CounterState* s = (CounterState*)ud;
+    s->count++;                        /* write native data to shared state */
+    AVar trigger = {0};                /* A_NULL trigger — no data in packet */
+    aFlux_componentEmit(comp, "out", &trigger);
     return AF_OK;
 }
 
-static AFStatus print_process(AFComponent comp, const char* p,
-                               const AVar* pkt, void* ud)
+static AFStatus printer_process(AFComponent comp, const char* in,
+                                 const AVar* pkt, void* ud)
 {
-    (void)comp; (void)p; (void)ud;
-    printf("got: %lld\n", (long long)aVar_asI64(pkt));
+    (void)comp; (void)in; (void)pkt;   /* packet ignored — data is in shared state */
+    CounterState* s = (CounterState*)ud;
+    printf("count: %d\n", s->count);  /* read native data directly */
     return AF_OK;
 }
 
 int main(void) {
-    static const AFPortMeta gen_out[]  = {{"out", NULL, "int64", false}};
-    static const AFPortMeta prn_in[]   = {{"in",  NULL, "any",   true }};
+    static const AFPortMeta src_out[] = {{"out", NULL, NULL, false}};
+    static const AFPortMeta prn_in[]  = {{"in",  NULL, NULL, true }};
 
-    AFComponent gen = aFlux_componentCreate(&(AFComponentDesc){
-        .type_name="example/Gen", .outport_count=1, .outports=gen_out,
-        .process=gen_process });
+    AFComponent src = aFlux_componentCreate(&(AFComponentDesc){
+        .type_name="example/Source", .outport_count=1, .outports=src_out,
+        .process=source_process, .userdata=&state });
     AFComponent prn = aFlux_componentCreate(&(AFComponentDesc){
-        .type_name="example/Print", .inport_count=1, .inports=prn_in,
-        .process=print_process });
+        .type_name="example/Printer", .inport_count=1, .inports=prn_in,
+        .process=printer_process, .userdata=&state });
 
     AFGraph g = aFlux_graphCreate();
-    aFlux_graphAddComponent(g, "gen", gen);
+    aFlux_graphAddComponent(g, "src", src);
     aFlux_graphAddComponent(g, "prn", prn);
-    aFlux_graphConnect(g, "gen","out", "prn","in");
+    aFlux_graphConnect(g, "src", "out", "prn", "in");
 
     AFScheduler s = aFlux_schedulerCreateSingleThread();
     aFlux_run(g, s);
@@ -354,33 +378,212 @@ int main(void) {
 
 ---
 
-### 5.2 Multi-Input / Multi-Output Component
+### 5.2 Native: Multi-Input / Multi-Output Component
 
-An adder that accumulates one packet on each of two inports before emitting. Emits on `err`
-if a value is out of range.
+Upstream sources write their values into shared `AdderState`, then emit a null trigger.
+The adder fires when both triggers have arrived, computes on native doubles, and emits
+on `out` or `err` accordingly.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    SRC_A["SourceA\nout: out"] -->|"out → a"| ADD
-    SRC_B["SourceB\nout: out"] -->|"out → b"| ADD
-    subgraph "math/Adder"
+    SRC_A["SourceA"] -->|"null trigger → a"| ADD
+    SRC_B["SourceB"] -->|"null trigger → b"| ADD
+    SRC_A <-->|"shared AdderState*"| ADD
+    SRC_B <-->|"shared AdderState*"| ADD
+    subgraph "math/Adder  (2 in, 2 out)"
         ADD[process]
     end
-    ADD -->|"out → in"| SINK["Sink\nin: in"]
-    ADD -->|"err → in"| ELOG["ErrorLog\nin: in"]
+    ADD -->|"null trigger → in"| SINK[Sink]
+    ADD -->|"null trigger → in"| ELOG[ErrorLog]
 ```
 
 ```c
-typedef struct { double a, b; bool has_a, has_b; } AdderState;
+typedef struct {
+    double a, b, result;
+    bool   has_a, has_b, overflow;
+} AdderState;
+static AdderState adder_state = {0};
+
+static AFStatus src_a_process(AFComponent comp, const char* in,
+                               const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt;
+    AdderState* s = (AdderState*)ud;
+    s->a = read_sensor_a();            /* native double — no AVar */
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, "out", &trigger);
+    return AF_OK;
+}
+
+static AFStatus src_b_process(AFComponent comp, const char* in,
+                               const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt;
+    AdderState* s = (AdderState*)ud;
+    s->b = read_sensor_b();
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, "out", &trigger);
+    return AF_OK;
+}
 
 static AFStatus adder_process(AFComponent comp, const char* inport,
                                const AVar* pkt, void* ud)
 {
-    AdderState* s = ud;
+    (void)pkt;                         /* trigger carries no data */
+    AdderState* s = (AdderState*)ud;
+    if      (strcmp(inport, "a") == 0) s->has_a = true;
+    else if (strcmp(inport, "b") == 0) s->has_b = true;
+    if (!s->has_a || !s->has_b) return AF_OK;
+
+    s->result   = s->a + s->b;         /* native arithmetic on shared state */
+    s->overflow = s->result > 1e6;
+    s->has_a = s->has_b = false;
+
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, s->overflow ? "err" : "out", &trigger);
+    return AF_OK;
+}
+
+static AFStatus sink_process(AFComponent comp, const char* in,
+                              const AVar* pkt, void* ud)
+{
+    (void)comp; (void)in; (void)pkt;
+    AdderState* s = (AdderState*)ud;
+    printf("result: %f\n", s->result); /* read native result directly */
+    return AF_OK;
+}
+```
+
+---
+
+### 5.3 Native: Three-Stage DSP Pipeline with Error Branch
+
+All three stages share a `DSPState` holding a native `float` buffer. Each stage processes
+the buffer in-place and emits a null trigger downstream. No AVar involved in any data path.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
+graph LR
+    SRC[Source] -->|trigger| LP[LowPass]
+    LP -->|trigger| AMP[Amplifier]
+    LP -->|trigger| EL[ErrorLog]
+    AMP -->|trigger| SINK[Sink]
+    SRC <-->|"shared DSPState*\nfloat buf[1024]"| LP
+    LP  <-->|"shared DSPState*"| AMP
+    AMP <-->|"shared DSPState*"| SINK
+```
+
+```c
+typedef struct { float buf[1024]; size_t len; float gain; } DSPState;
+static DSPState dsp = { .len=256, .gain=2.0f };
+
+static AFStatus source_process(AFComponent comp, const char* in,
+                                const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt;
+    DSPState* s = (DSPState*)ud;
+    for (size_t i = 0; i < s->len; i++)
+        s->buf[i] = sinf((float)i * 0.1f);  /* fill native float buffer */
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, "out", &trigger);
+    return AF_OK;
+}
+
+static AFStatus lowpass_process(AFComponent comp, const char* in,
+                                 const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt;
+    DSPState* s = (DSPState*)ud;
+    for (size_t i = 1; i < s->len; i++)     /* in-place filter on native floats */
+        s->buf[i] = 0.5f * s->buf[i] + 0.5f * s->buf[i-1];
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, is_clipping(s->buf, s->len) ? "err" : "out", &trigger);
+    return AF_OK;
+}
+
+static AFStatus amplifier_process(AFComponent comp, const char* in,
+                                   const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt;
+    DSPState* s = (DSPState*)ud;
+    for (size_t i = 0; i < s->len; i++)
+        s->buf[i] *= s->gain;               /* multiply by native gain */
+    AVar trigger = {0};
+    aFlux_componentEmit(comp, "out", &trigger);
+    return AF_OK;
+}
+
+static AFStatus sink_process(AFComponent comp, const char* in,
+                              const AVar* pkt, void* ud)
+{
+    (void)comp; (void)in; (void)pkt;
+    DSPState* s = (DSPState*)ud;
+    write_output(s->buf, s->len);           /* write native floats to output */
+    return AF_OK;
+}
+```
+
+---
+
+### 5.4 Introducing AVar: Data in the Packet
+
+The native examples above share data through `userdata` — components are tightly coupled
+via shared memory. `AVar` lets you carry data **in the packet** instead:
+
+- Components become self-contained and reusable — no shared state struct
+- Required when components live in different processes or languages
+- Required across subgraph boundaries between different runtime instances
+- Packet observer always receives `AVar`, so monitoring works without shared pointers
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
+graph LR
+    subgraph "Native (5.1)"
+        N1[Source] -->|"null trigger"| N2[Printer]
+        N1 <-->|"shared state"| N2
+    end
+    subgraph "AVar (5.4)"
+        A1[Source] -->|"AVar int32 = 42"| A2[Printer]
+    end
+```
+
+Same two-component pipeline — but now the counter value travels IN the packet. No shared
+state; the components are fully decoupled:
+
+```c
+static AFStatus source_process(AFComponent comp, const char* in,
+                                const AVar* pkt, void* ud)
+{
+    (void)in; (void)pkt; (void)ud;
+    static int count = 0;
+    AVar out = {0};
+    aVar_setI32(&out, ++count);          /* data IN the packet */
+    aFlux_componentEmit(comp, "out", &out);
+    aVar_clear(&out);
+    return AF_OK;
+}
+
+static AFStatus printer_process(AFComponent comp, const char* in,
+                                 const AVar* pkt, void* ud)
+{
+    (void)comp; (void)in; (void)ud;
+    printf("count: %d\n", aVar_asI32(pkt));   /* read from packet */
+    return AF_OK;
+}
+```
+
+Multi-type adder — same 2-input/2-output topology as §5.2 but data travels in AVar packets,
+so upstream components need no knowledge of each other's state:
+
+```c
+static AFStatus adder_process(AFComponent comp, const char* inport,
+                               const AVar* pkt, void* ud)
+{
+    AdderState* s = (AdderState*)ud;
+    /* read value directly from the packet — no shared struct needed */
     if      (strcmp(inport, "a") == 0) { s->a = aVar_asDouble(pkt); s->has_a = true; }
     else if (strcmp(inport, "b") == 0) { s->b = aVar_asDouble(pkt); s->has_b = true; }
-
     if (!s->has_a || !s->has_b) return AF_OK;
 
     double sum = s->a + s->b;
@@ -388,7 +591,7 @@ static AFStatus adder_process(AFComponent comp, const char* inport,
 
     AVar out = {0};
     if (sum > 1e6) {
-        aVar_setString(&out, "overflow", false);
+        aVar_setString(&out, "overflow", /*copy=*/false);
         aFlux_componentEmit(comp, "err", &out);
     } else {
         aVar_setDouble(&out, sum);
@@ -397,238 +600,126 @@ static AFStatus adder_process(AFComponent comp, const char* inport,
     aVar_clear(&out);
     return AF_OK;
 }
-
-/* Descriptor */
-static const AFPortMeta adder_in[] = {
-    {"a", "First operand",  "double", true},
-    {"b", "Second operand", "double", true},
-};
-static const AFPortMeta adder_out[] = {
-    {"out", "Sum",   "double", false},
-    {"err", "Error", "string", false},
-};
-static AdderState adder_state = {0};
-static const AFComponentDesc adder_desc = {
-    .type_name     = "math/Adder",
-    .inport_count  = 2, .inports  = adder_in,
-    .outport_count = 2, .outports = adder_out,
-    .process       = adder_process,
-    .userdata      = &adder_state,
-};
 ```
 
 ---
 
-### 5.3 Three-Stage Pipeline with Error Branch
+### 5.5 Subgraph with Multiple Exposed Ports and AVar
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
-graph LR
-    SRC["Source\nout: samples"] -->|"samples→in"| LP["LowPass\nin:in\nout:out\nerr:err"]
-    LP -->|"out→in"| AMP["Amplifier\nin:in\nout:out"]
-    LP -->|"err→in"| EL["ErrorLog\nin:in"]
-    AMP -->|"out→in"| SINK["Sink\nin:in"]
-```
-
-```c
-int main(void) {
-    AFComponent src    = aFlux_createComponentByType("dsp/Source");
-    AFComponent lp     = aFlux_createComponentByType("dsp/LowPass");
-    AFComponent amp    = aFlux_createComponentByType("dsp/Amplifier");
-    AFComponent sink   = aFlux_createComponentByType("dsp/Sink");
-    AFComponent errlog = aFlux_createComponentByType("core/Output");
-
-    AFGraph g = aFlux_graphCreate();
-    aFlux_graphAddComponent(g, "src",    src);
-    aFlux_graphAddComponent(g, "lp",     lp);
-    aFlux_graphAddComponent(g, "amp",    amp);
-    aFlux_graphAddComponent(g, "sink",   sink);
-    aFlux_graphAddComponent(g, "errlog", errlog);
-
-    aFlux_graphConnect(g, "src",    "samples", "lp",     "in");
-    aFlux_graphConnect(g, "lp",     "out",     "amp",    "in");
-    aFlux_graphConnect(g, "lp",     "err",     "errlog", "in");
-    aFlux_graphConnect(g, "amp",    "out",     "sink",   "in");
-
-    /* IIP: set amplifier gain before start */
-    AVar gain = {0};
-    aVar_setDouble(&gain, 2.5);
-    aFlux_graphSetIIP(g, "amp", "gain", &gain);
-    aVar_clear(&gain);
-
-    AFScheduler sched = aFlux_schedulerCreateThreadPool(4);
-    aFlux_run(g, sched);
-    aFlux_schedulerDestroy(sched);
-    aFlux_graphDestroy(g);
-}
-```
-
----
-
-### 5.4 Subgraph with Multiple Exposed Ports
-
-Build a reusable `NormClamp` subgraph with two inports and two outports, then embed it in a
-parent graph.
+Subgraph ports always use `AVar` — data crossing a subgraph boundary is carried in
+the packet, not via shared state (subgraphs may be in different runtime instances).
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph TB
-    subgraph "NormClamp subgraph — external view"
-        EI1["in: in_value"]
-        EI2["in: in_scale"]
-        EO1["out: out_result"]
-        EO2["out: out_overflow"]
+    subgraph "NormClamp subgraph — external"
+        EI1["in: in_value  (AVar double)"]
+        EI2["in: in_scale  (AVar double)"]
+        EO1["out: out_result   (AVar double)"]
+        EO2["out: out_overflow (AVar string)"]
     end
     subgraph "NormClamp subgraph — internal"
-        NORM["dsp/Normalise\nin:value, scale\nout:out"] -->|out→in| CLAMP["dsp/Clamp\nin:in\nout:out, over"]
+        NORM[Normalise] -->|"AVar double"| CLAMP[Clamp]
     end
-    EI1 -.->|maps to| NORM
-    EI2 -.->|maps to| NORM
-    CLAMP -.->|maps to| EO1
-    CLAMP -.->|maps to| EO2
+    EI1 -.-> NORM
+    EI2 -.-> NORM
+    CLAMP -.-> EO1
+    CLAMP -.-> EO2
 ```
 
 ```c
-/* Build the subgraph */
+/* Internal Normalise component — receives AVar doubles on two inports */
+typedef struct { double value, scale; bool has_v, has_s; } NormState;
+
+static AFStatus norm_process(AFComponent comp, const char* inport,
+                              const AVar* pkt, void* ud)
+{
+    NormState* s = (NormState*)ud;
+    if      (strcmp(inport, "value") == 0) { s->value = aVar_asDouble(pkt); s->has_v = true; }
+    else if (strcmp(inport, "scale") == 0) { s->scale = aVar_asDouble(pkt); s->has_s = true; }
+    if (!s->has_v || !s->has_s) return AF_OK;
+    AVar out = {0};
+    aVar_setDouble(&out, s->value / (s->scale == 0.0 ? 1.0 : s->scale));
+    s->has_v = s->has_s = false;
+    aFlux_componentEmit(comp, "out", &out);
+    aVar_clear(&out);
+    return AF_OK;
+}
+
+/* Build and expose the subgraph */
 AFGraph sub = aFlux_graphCreateNamed("NormClamp");
-
-AFComponent norm  = aFlux_createComponentByType("dsp/Normalise");
-AFComponent clamp = aFlux_createComponentByType("dsp/Clamp");
-
-aFlux_graphAddComponent(sub, "norm",  norm);
-aFlux_graphAddComponent(sub, "clamp", clamp);
+aFlux_graphAddComponent(sub, "norm",  aFlux_componentCreate(&norm_desc));
+aFlux_graphAddComponent(sub, "clamp", aFlux_componentCreate(&clamp_desc));
 aFlux_graphConnect(sub, "norm", "out", "clamp", "in");
+aFlux_graphExposeInport (sub, "in_value",     "norm",  "value");
+aFlux_graphExposeInport (sub, "in_scale",     "norm",  "scale");
+aFlux_graphExposeOutport(sub, "out_result",   "clamp", "out");
+aFlux_graphExposeOutport(sub, "out_overflow", "clamp", "over");
 
-/* Expose external ports */
-aFlux_graphExposeInport (sub, "in_value",    "norm",  "value");
-aFlux_graphExposeInport (sub, "in_scale",    "norm",  "scale");
-aFlux_graphExposeOutport(sub, "out_result",  "clamp", "out");
-aFlux_graphExposeOutport(sub, "out_overflow","clamp", "over");
-
-/* Embed in parent graph — sub is cast as AFComponent */
+/* Parent graph connects to subgraph using the exposed port names */
 AFGraph parent = aFlux_graphCreate();
-
-AFComponent src   = aFlux_createComponentByType("dsp/Source");
-AFComponent cfg   = aFlux_createComponentByType("core/Config");
-AFComponent sink  = aFlux_createComponentByType("dsp/Sink");
-AFComponent esink = aFlux_createComponentByType("core/Output");
-
-aFlux_graphAddComponent(parent, "src",   src);
-aFlux_graphAddComponent(parent, "cfg",   cfg);
-aFlux_graphAddComponent(parent, "proc",  (AFComponent)sub);
-aFlux_graphAddComponent(parent, "sink",  sink);
-aFlux_graphAddComponent(parent, "esink", esink);
-
-aFlux_graphConnect(parent, "src",  "value",        "proc",  "in_value");
-aFlux_graphConnect(parent, "cfg",  "scale",         "proc",  "in_scale");
-aFlux_graphConnect(parent, "proc", "out_result",    "sink",  "in");
-aFlux_graphConnect(parent, "proc", "out_overflow",  "esink", "in");
+aFlux_graphAddComponent(parent, "src",  aFlux_createComponentByType("dsp/Source"));
+aFlux_graphAddComponent(parent, "proc", (AFComponent)sub);
+aFlux_graphAddComponent(parent, "sink", aFlux_createComponentByType("dsp/Sink"));
+aFlux_graphAddComponent(parent, "err",  aFlux_createComponentByType("core/Output"));
+aFlux_graphConnect(parent, "src",  "value",        "proc", "in_value");
+aFlux_graphConnect(parent, "src",  "scale",        "proc", "in_scale");
+aFlux_graphConnect(parent, "proc", "out_result",   "sink", "in");
+aFlux_graphConnect(parent, "proc", "out_overflow", "err",  "in");
 
 AFScheduler sched = aFlux_schedulerCreateThreadPool(2);
 aFlux_run(parent, sched);
 aFlux_schedulerDestroy(sched);
-aFlux_graphDestroy(parent);   /* recursively destroys sub */
+aFlux_graphDestroy(parent);
 ```
 
 ---
 
-### 5.5 Native Typed Packets on the Hot Path
+### 5.6 Complex Nested Pipeline with AVar
 
-Within a single C process, components share state via `userdata` — no `AVar` on the critical
-path. `AVar` is introduced only at the monitoring boundary.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
-graph LR
-    A["Filter\nwrites float* to shared buf"] -->|"shared PipelineState*\nzero copy"| B["Gain\nreads float* from shared buf"]
-    B -->|"AVar for monitoring only"| OBS["Packet Observer\naVar_setCustom(buf)"]
-```
-
-```c
-/* Shared typed state — lives outside AVar entirely */
-typedef struct {
-    float   samples[1024];
-    size_t  len;
-    float   gain;
-} PipelineState;
-
-static AFStatus filter_process(AFComponent comp, const char* port,
-                                const AVar* pkt, void* ud)
-{
-    PipelineState* s = ud;
-    (void)comp; (void)port;
-    /* Read input from AVar (at graph entry point), then work natively */
-    s->len = aVar_asI64(pkt);   /* packet carries sample count */
-    dsp_lowpass(s->samples, s->len);
-    /* Emit a trivial "ready" signal so the next component fires */
-    AVar ready = {0};
-    aVar_setNull(&ready);
-    aFlux_componentEmit(comp, "out", &ready);
-    return AF_OK;
-}
-
-static AFStatus gain_process(AFComponent comp, const char* port,
-                              const AVar* pkt, void* ud)
-{
-    PipelineState* s = ud;
-    (void)comp; (void)port; (void)pkt;
-    /* Read directly from shared buffer — zero conversion */
-    for (size_t i = 0; i < s->len; i++) s->samples[i] *= s->gain;
-    AVar out = {0};
-    aVar_setCustom(&out, s->samples, false);   /* borrow — no copy */
-    aFlux_componentEmit(comp, "out", &out);
-    return AF_OK;
-}
-```
-
----
-
-### 5.6 Complex Nested Pipeline
-
-Two subgraphs chained together inside a parent; each subgraph has multiple ports.
+Two subgraphs chained together; all cross-boundary data travels as AVar packets.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    SRC[Source] -->|"raw→in_raw"| SUB1
-    SRC -->|"cfg→in_cfg"| SUB1
-    subgraph "PreProcess subgraph"
+    SRC[Source] -->|"AVar binary → in_raw"| SUB1
+    SRC -->|"AVar map → in_cfg"| SUB1
+    subgraph "PreProcess"
         SUB1["in:in_raw, in_cfg\nout:out_clean, out_meta"]
     end
-    SUB1 -->|"out_clean→in_data"| SUB2
-    SUB1 -->|"out_meta→in_meta"| SUB2
-    subgraph "Analyse subgraph"
+    SUB1 -->|"AVar double[] → in_data"| SUB2
+    SUB1 -->|"AVar map → in_meta"| SUB2
+    subgraph "Analyse"
         SUB2["in:in_data, in_meta\nout:result, out_diag"]
     end
-    SUB2 -->|"result→in"| SINK[Sink]
-    SUB2 -->|"out_diag→in"| DIAG[Diagnostics]
+    SUB2 -->|"AVar map → in"| SINK[Sink]
+    SUB2 -->|"AVar string → in"| DIAG[Diagnostics]
 ```
 
 ```c
-/* Build PreProcess subgraph */
+/* PreProcess subgraph */
 AFGraph pre = aFlux_graphCreateNamed("PreProcess");
-/* ... add components, connections ... */
+/* ... build internal components ... */
 aFlux_graphExposeInport (pre, "in_raw",    "decode", "raw");
 aFlux_graphExposeInport (pre, "in_cfg",    "decode", "cfg");
 aFlux_graphExposeOutport(pre, "out_clean", "filter", "out");
 aFlux_graphExposeOutport(pre, "out_meta",  "meta",   "out");
 
-/* Build Analyse subgraph */
+/* Analyse subgraph */
 AFGraph ana = aFlux_graphCreateNamed("Analyse");
-/* ... add components, connections ... */
+/* ... build internal components ... */
 aFlux_graphExposeInport (ana, "in_data",  "fft",    "in");
 aFlux_graphExposeInport (ana, "in_meta",  "label",  "meta");
 aFlux_graphExposeOutport(ana, "result",   "output", "out");
 aFlux_graphExposeOutport(ana, "out_diag", "diag",   "out");
 
-/* Parent */
+/* Parent graph */
 AFGraph parent = aFlux_graphCreate();
 aFlux_graphAddComponent(parent, "src",  aFlux_createComponentByType("io/Source"));
 aFlux_graphAddComponent(parent, "pre",  (AFComponent)pre);
 aFlux_graphAddComponent(parent, "ana",  (AFComponent)ana);
 aFlux_graphAddComponent(parent, "sink", aFlux_createComponentByType("io/Sink"));
 aFlux_graphAddComponent(parent, "diag", aFlux_createComponentByType("core/Output"));
-
 aFlux_graphConnect(parent, "src", "raw",       "pre", "in_raw");
 aFlux_graphConnect(parent, "src", "cfg",       "pre", "in_cfg");
 aFlux_graphConnect(parent, "pre", "out_clean", "ana", "in_data");
