@@ -102,39 +102,43 @@ graph LR
     P --> ERR["outport: err"]
 ```
 
-The callback receives the **name of the inport that fired** so a multi-input component
-can dispatch across its inports. Upstream components write into the shared `userdata` state
-before emitting a trigger; the adder just tracks readiness:
+Two callback types are available — one for AVar packets, one for native pointers:
+
+- **`process`** (`AFProcessFn`) — called when an AVar packet arrives (from `aFlux_componentEmit`)
+- **`native_process`** (`AFNativeProcessFn`) — called when a native pointer arrives (from `aFlux_componentEmitPtr`)
+
+A component can set either or both. For multi-input dispatch:
 
 ```c
-/* Upstream sources write to shared state then emit a null trigger */
-static AFStatus src_a_process(AFComponent comp, const char* in,
-                               const AVar* pkt, void* ud)
+/* Sources emit a pointer to their native double — no AVar */
+static AFStatus src_a_native(AFComponent comp, const char* in,
+                              void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
-    AdderState* s = ud;
-    s->a = read_sensor_a();          /* native double — no AVar involved */
-    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
+    (void)in; (void)ptr;             /* this is a trigger source; ptr unused */
+    double* val = (double*)ud;       /* value lives in component's userdata  */
+    *val = read_sensor_a();
+    aFlux_componentEmitPtr(comp, "out", val);  /* emit pointer — zero copy */
     return AF_OK;
 }
 
-/* Adder fires when both triggers have arrived */
-static AFStatus adder_process(AFComponent comp, const char* inport,
-                               const AVar* pkt, void* ud)
+/* Adder receives native pointer on each inport */
+static AFStatus adder_native(AFComponent comp, const char* inport,
+                              void* ptr, void* ud)
 {
-    (void)pkt;                       /* trigger carries no data — ignore it */
-    AdderState* s = ud;
-    if      (strcmp(inport, "a") == 0) s->has_a = true;
-    else if (strcmp(inport, "b") == 0) s->has_b = true;
+    AdderState* s = (AdderState*)ud;
+    double val = *(double*)ptr;      /* read native double from pointer */
+    if      (strcmp(inport, "a") == 0) { s->a = val; s->has_a = true; }
+    else if (strcmp(inport, "b") == 0) { s->b = val; s->has_b = true; }
     if (!s->has_a || !s->has_b) return AF_OK;
-    s->result  = s->a + s->b;        /* native arithmetic on shared state */
+    s->result  = s->a + s->b;
     s->has_a   = s->has_b = false;
-    aFlux_componentEmit(comp, "out", NULL);
+    aFlux_componentEmitPtr(comp, "out", &s->result);  /* pass result pointer */
     return AF_OK;
 }
 ```
 
-See §5.4 for using `AVar` to carry data IN the packet instead of through shared state.
+See §5.4 for `AVar` — required when crossing language boundaries or subgraph boundaries
+between different runtime instances.
 
 ### 3.2 Multiple Ports
 
@@ -248,7 +252,8 @@ flowchart TD
 | `aFlux_componentCreate` | Instantiate from an `AFComponentDesc` |
 | `aFlux_componentDestroy` | Destroy component |
 | `aFlux_componentGetPort` | Get a port handle by name and direction |
-| `aFlux_componentEmit` | Emit a packet on a named outport (call from `AFProcessFn`) |
+| `aFlux_componentEmit` | Emit an AVar packet on a named outport |
+| `aFlux_componentEmitPtr` | Emit a native pointer on a named outport (zero copy, no AVar) |
 | `aFlux_componentUserdata` | Get userdata pointer |
 | `aFlux_componentSetUserdata` | Replace userdata pointer |
 | `aFlux_registerComponent` | Register a type in the global registry |
@@ -313,48 +318,46 @@ flowchart TD
 
 ### 5.1 Simple Two-Component Pipeline
 
-A generator emits an integer value via its `out` port; a printer receives it on `in` and
-prints it. This is the basic AnyFlux pattern: data travels through the port connection.
+A generator passes an integer to a printer via a port. Data travels in the pointer
+— no AVar, no shared state, no copy.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    GEN["Generator\nout: out"] -->|"int value = 42"| PRT["Printer\nin: in"]
+    GEN["Generator\nout: out"] -->|"int* (native pointer)"| PRT["Printer\nin: in"]
 ```
 
 ```c
 #include "anyflux.h"
-#include "anyvar.h"
 
-static AFStatus gen_process(AFComponent comp, const char* in,
-                             const AVar* pkt, void* ud)
+static int gen_value = 42;
+
+static AFStatus gen_native(AFComponent comp, const char* in,
+                            void* ptr, void* ud)
 {
-    (void)in; (void)pkt; (void)ud;
-    AVar out = {0};
-    aVar_setI32(&out, 42);
-    aFlux_componentEmit(comp, "out", &out);
-    aVar_clear(&out);
+    (void)in; (void)ptr; (void)ud;
+    aFlux_componentEmitPtr(comp, "out", &gen_value);  /* emit pointer — no copy */
     return AF_OK;
 }
 
-static AFStatus print_process(AFComponent comp, const char* in,
-                               const AVar* pkt, void* ud)
+static AFStatus print_native(AFComponent comp, const char* in,
+                              void* ptr, void* ud)
 {
     (void)comp; (void)in; (void)ud;
-    printf("value: %d\n", aVar_asI32(pkt));
+    printf("value: %d\n", *(int*)ptr);               /* read native int directly */
     return AF_OK;
 }
 
 int main(void) {
-    static const AFPortMeta gen_out[] = {{"out", NULL, "int32", false}};
-    static const AFPortMeta prn_in[]  = {{"in",  NULL, "int32", true }};
+    static const AFPortMeta gen_out[] = {{"out", NULL, "int*", false}};
+    static const AFPortMeta prn_in[]  = {{"in",  NULL, "int*", true }};
 
     AFComponent gen = aFlux_componentCreate(&(AFComponentDesc){
         .type_name="example/Gen", .outport_count=1, .outports=gen_out,
-        .process=gen_process });
+        .native_process=gen_native });
     AFComponent prn = aFlux_componentCreate(&(AFComponentDesc){
         .type_name="example/Print", .inport_count=1, .inports=prn_in,
-        .process=print_process });
+        .native_process=print_native });
 
     AFGraph g = aFlux_graphCreate();
     aFlux_graphAddComponent(g, "gen", gen);
@@ -372,74 +375,65 @@ int main(void) {
 
 ### 5.2 Native: Multi-Input / Multi-Output Component
 
-Upstream sources write their values into shared `AdderState`, then emit a null trigger.
-The adder fires when both triggers have arrived, computes on native doubles, and emits
-on `out` or `err` accordingly.
+Sources emit pointers to their native doubles. The adder receives each pointer, accumulates
+both values, then emits a pointer to the result. No shared state, no AVar.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    SRC_A["SourceA"] -->|"null trigger → a"| ADD
-    SRC_B["SourceB"] -->|"null trigger → b"| ADD
-    SRC_A <-->|"shared AdderState*"| ADD
-    SRC_B <-->|"shared AdderState*"| ADD
+    SRC_A["SourceA"] -->|"double* → a"| ADD
+    SRC_B["SourceB"] -->|"double* → b"| ADD
     subgraph "math/Adder  (2 in, 2 out)"
-        ADD[process]
+        ADD[native_process]
     end
-    ADD -->|"null trigger → in"| SINK[Sink]
-    ADD -->|"null trigger → in"| ELOG[ErrorLog]
+    ADD -->|"double* → in"| SINK[Sink]
+    ADD -->|"double* → in"| ELOG[ErrorLog]
 ```
 
 ```c
-typedef struct {
-    double a, b, result;
-    bool   has_a, has_b, overflow;
-} AdderState;
+typedef struct { double a, b, result; bool has_a, has_b; } AdderState;
 static AdderState adder_state = {0};
 
-static AFStatus src_a_process(AFComponent comp, const char* in,
-                               const AVar* pkt, void* ud)
+static double val_a, val_b;  /* values live in source components */
+
+static AFStatus src_a_native(AFComponent comp, const char* in,
+                              void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
-    AdderState* s = (AdderState*)ud;
-    s->a = read_sensor_a();                  /* native double — no AVar */
-    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger */
+    (void)in; (void)ptr; (void)ud;
+    val_a = read_sensor_a();                     /* read native double */
+    aFlux_componentEmitPtr(comp, "out", &val_a); /* emit pointer */
     return AF_OK;
 }
 
-static AFStatus src_b_process(AFComponent comp, const char* in,
-                               const AVar* pkt, void* ud)
+static AFStatus src_b_native(AFComponent comp, const char* in,
+                              void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
-    AdderState* s = (AdderState*)ud;
-    s->b = read_sensor_b();
-    aFlux_componentEmit(comp, "out", NULL);
+    (void)in; (void)ptr; (void)ud;
+    val_b = read_sensor_b();
+    aFlux_componentEmitPtr(comp, "out", &val_b);
     return AF_OK;
 }
 
-static AFStatus adder_process(AFComponent comp, const char* inport,
-                               const AVar* pkt, void* ud)
+static AFStatus adder_native(AFComponent comp, const char* inport,
+                              void* ptr, void* ud)
 {
-    (void)pkt;                               /* trigger carries no data */
     AdderState* s = (AdderState*)ud;
-    if      (strcmp(inport, "a") == 0) s->has_a = true;
-    else if (strcmp(inport, "b") == 0) s->has_b = true;
+    double val = *(double*)ptr;                  /* read from pointer — no copy */
+    if      (strcmp(inport, "a") == 0) { s->a = val; s->has_a = true; }
+    else if (strcmp(inport, "b") == 0) { s->b = val; s->has_b = true; }
     if (!s->has_a || !s->has_b) return AF_OK;
-
-    s->result   = s->a + s->b;               /* native arithmetic on shared state */
-    s->overflow = s->result > 1e6;
-    s->has_a = s->has_b = false;
-
-    aFlux_componentEmit(comp, s->overflow ? "err" : "out", NULL);
+    s->result  = s->a + s->b;
+    s->has_a   = s->has_b = false;
+    const char* port = s->result > 1e6 ? "err" : "out";
+    aFlux_componentEmitPtr(comp, port, &s->result);  /* emit result pointer */
     return AF_OK;
 }
 
-static AFStatus sink_process(AFComponent comp, const char* in,
-                              const AVar* pkt, void* ud)
+static AFStatus sink_native(AFComponent comp, const char* in,
+                             void* ptr, void* ud)
 {
-    (void)comp; (void)in; (void)pkt;
-    AdderState* s = (AdderState*)ud;
-    printf("result: %f\n", s->result);       /* read native double directly */
+    (void)comp; (void)in; (void)ud;
+    printf("result: %f\n", *(double*)ptr);       /* read native double */
     return AF_OK;
 }
 ```
@@ -448,64 +442,62 @@ static AFStatus sink_process(AFComponent comp, const char* in,
 
 ### 5.3 Native: Three-Stage DSP Pipeline with Error Branch
 
-All three stages share a `DSPState` holding a native `float` buffer. Each stage processes
-the buffer in-place and emits a null trigger downstream. No AVar involved in any data path.
+The source emits a pointer to a `DSPState` buffer. Each stage receives the same pointer,
+processes the buffer in-place, and passes the pointer forward. Zero copies, no AVar,
+no shared state between components.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
 graph LR
-    SRC[Source] -->|trigger| LP[LowPass]
-    LP -->|trigger| AMP[Amplifier]
-    LP -->|trigger| EL[ErrorLog]
-    AMP -->|trigger| SINK[Sink]
-    SRC <-->|"shared DSPState*\nfloat buf[1024]"| LP
-    LP  <-->|"shared DSPState*"| AMP
-    AMP <-->|"shared DSPState*"| SINK
+    SRC[Source] -->|"DSPState*"| LP[LowPass]
+    LP -->|"DSPState*"| AMP[Amplifier]
+    LP -->|"DSPState*"| EL[ErrorLog]
+    AMP -->|"DSPState*"| SINK[Sink]
 ```
 
 ```c
 typedef struct { float buf[1024]; size_t len; float gain; } DSPState;
-static DSPState dsp = { .len=256, .gain=2.0f };
 
-static AFStatus source_process(AFComponent comp, const char* in,
-                                const AVar* pkt, void* ud)
+static AFStatus source_native(AFComponent comp, const char* in,
+                               void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
+    (void)in; (void)ptr;
     DSPState* s = (DSPState*)ud;
     for (size_t i = 0; i < s->len; i++)
-        s->buf[i] = sinf((float)i * 0.1f);  /* fill native float buffer */
-    aFlux_componentEmit(comp, "out", NULL);  /* NULL = null trigger, no AVar */
+        s->buf[i] = sinf((float)i * 0.1f);       /* fill native float buffer */
+    aFlux_componentEmitPtr(comp, "out", s);       /* emit pointer to buffer */
     return AF_OK;
 }
 
-static AFStatus lowpass_process(AFComponent comp, const char* in,
-                                 const AVar* pkt, void* ud)
+static AFStatus lowpass_native(AFComponent comp, const char* in,
+                                void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
-    DSPState* s = (DSPState*)ud;
-    for (size_t i = 1; i < s->len; i++)      /* in-place filter on native floats */
+    (void)in; (void)ud;
+    DSPState* s = (DSPState*)ptr;                 /* received pointer — no copy */
+    for (size_t i = 1; i < s->len; i++)
         s->buf[i] = 0.5f * s->buf[i] + 0.5f * s->buf[i-1];
-    aFlux_componentEmit(comp, is_clipping(s->buf, s->len) ? "err" : "out", NULL);
+    const char* port = is_clipping(s->buf, s->len) ? "err" : "out";
+    aFlux_componentEmitPtr(comp, port, s);        /* pass same pointer forward */
     return AF_OK;
 }
 
-static AFStatus amplifier_process(AFComponent comp, const char* in,
-                                   const AVar* pkt, void* ud)
+static AFStatus amplifier_native(AFComponent comp, const char* in,
+                                  void* ptr, void* ud)
 {
-    (void)in; (void)pkt;
-    DSPState* s = (DSPState*)ud;
+    (void)in; (void)ud;
+    DSPState* s = (DSPState*)ptr;
     for (size_t i = 0; i < s->len; i++)
-        s->buf[i] *= s->gain;                /* multiply by native gain */
-    aFlux_componentEmit(comp, "out", NULL);
+        s->buf[i] *= s->gain;                     /* in-place on native floats */
+    aFlux_componentEmitPtr(comp, "out", s);
     return AF_OK;
 }
 
-static AFStatus sink_process(AFComponent comp, const char* in,
-                              const AVar* pkt, void* ud)
+static AFStatus sink_native(AFComponent comp, const char* in,
+                             void* ptr, void* ud)
 {
-    (void)comp; (void)in; (void)pkt;
-    DSPState* s = (DSPState*)ud;
-    write_output(s->buf, s->len);            /* write native floats to output */
+    (void)comp; (void)in; (void)ud;
+    DSPState* s = (DSPState*)ptr;
+    write_output(s->buf, s->len);                 /* write native floats to output */
     return AF_OK;
 }
 ```

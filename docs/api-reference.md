@@ -83,9 +83,10 @@ typedef struct AFComponentDesc {
     uint32_t           outport_count;  /* number of entries in outports[]         */
     const AFPortMeta*  outports;       /* array of outport metadata               */
 
-    AFSetupFn          setup;          /* called once before graph starts; NULL ok */
-    AFProcessFn        process;        /* called when packet arrives on any inport */
-    AFTeardownFn       teardown;       /* called once after graph stops; NULL ok   */
+    AFSetupFn          setup;          /* called once before graph starts; NULL ok          */
+    AFProcessFn        process;        /* called when AVar packet arrives on any inport     */
+    AFNativeProcessFn  native_process; /* called when emitPtr pointer arrives; NULL ok      */
+    AFTeardownFn       teardown;       /* called once after graph stops; NULL ok            */
 
     void*              userdata;       /* passed as-is to all callbacks            */
 } AFComponentDesc;
@@ -123,12 +124,21 @@ typedef struct AFTransportVtable {
 /* Called once before the graph starts. Return AF_OK or an error to abort start. */
 typedef AFStatus (*AFSetupFn)(AFComponent comp, void* userdata);
 
-/* Called when a packet arrives on any inport.
+/* Called when an AVar packet arrives on any inport.
  * inport   — name of the inport that received the packet
- * packet   — borrowed; valid only for the duration of this call
+ * packet   — borrowed AVar; valid only for the duration of this call
  * Return AF_OK on success; any error code triggers the error observer. */
 typedef AFStatus (*AFProcessFn)(AFComponent comp, const char* inport,
                                  const AVar* packet, void* userdata);
+
+/* Called when a native pointer arrives on any inport (sent via aFlux_componentEmitPtr).
+ * inport   — name of the inport that received the pointer
+ * ptr      — the raw pointer emitted by the upstream component; not copied
+ * Lifetime: valid only for the duration of this call unless the sender
+ *           guarantees a longer lifetime.
+ * Return AF_OK on success; any error code triggers the error observer. */
+typedef AFStatus (*AFNativeProcessFn)(AFComponent comp, const char* inport,
+                                       void* ptr, void* userdata);
 
 /* Called once after the graph stops. */
 typedef void (*AFTeardownFn)(AFComponent comp, void* userdata);
@@ -300,6 +310,23 @@ Pass `packet = NULL` to send a null trigger (type `A_NULL`) with no data — the
 component's `process` callback fires but carries no payload.
 Returns `AF_OK` if the port is unconnected (silent no-op). Returns `AF_ERR_FULL` if
 back-pressure is active and the buffer is at capacity.
+
+#### `aFlux_componentEmitPtr`
+```c
+AFStatus aFlux_componentEmitPtr(AFComponent comp, const char* outport, void* ptr);
+```
+Emits a native pointer on the named outport. The pointer is **not copied** — the
+receiving component's `native_process` callback receives `ptr` directly.
+Intended for same-language, same-process hot paths where AVar overhead is undesirable
+(e.g. large structs, float buffers, image frames).
+
+| Param | Description |
+|---|---|
+| `ptr` | Raw pointer to native data. Must remain valid for the duration of the downstream `native_process` call. |
+
+If the downstream component has only `process` (AVar) and no `native_process`, the
+runtime wraps `ptr` in an `A_CUSTOM` borrowed AVar automatically.
+Returns `AF_OK` if the port is unconnected (silent no-op).
 
 #### `aFlux_componentUserdata`
 ```c
