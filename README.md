@@ -190,14 +190,16 @@ aVar_clear(&cbor);
 **Error codes:** `AVAR_OK` · `AVAR_ERR_TYPE` · `AVAR_ERR_NULL` · `AVAR_ERR_OOM` · `AVAR_ERR_BOUNDS` · `AVAR_ERR_KEY` · `AVAR_ERR_BACKEND` · `AVAR_ERR_ARGS`
 
 > See [AnyVar](https://github.com/visionik/anyvar) (`include/anyvar.h`) for the full API, `ABackend` vtable, `AVarAllocator` hooks, and ownership rules.
-> Fast path: bypass `AVar` entirely when types match and remain within the same language/process.
+> **Typed packets:** `AVar` is required only at ABI boundaries (FFI, wire protocol, observability callbacks). Within a single language/process on the hot path, components pass native types directly via shared `userdata` — zero conversion, zero overhead.
 
 ### 2.2 Ports
 
 - **InPort** and **OutPort** — named (e.g., `"data"`, `"error"`).
-- Support single ports and array ports (fan-in/fan-out).
+- Components can have **any number** of named inports and outports.
+- Support array ports for fan-in/fan-out (e.g., `out[N]`).
 - Typed or `AVar` mode.
 - Pull-based interface (inspired by RAMEN) for embedded/low-overhead use: `Puller<T>` / `Pullable<T>`.
+- Unconnected outports are a silent no-op; optional inports simply never fire.
 
 ### 2.3 Component / Node
 
@@ -220,8 +222,8 @@ stateDiagram-v2
 
 **Defined by:**
 
-- Input ports + Output ports (with metadata: type hints, description).
-- Processing logic (callback, method, or lambda).
+- Input ports + Output ports (with metadata: type hints, description) — any number of each.
+- Processing logic (callback, method, or lambda). The callback receives the **name of the inport that fired**, enabling multi-input dispatch.
 - Lifecycle: `setup()`, `process()`, `teardown()`.
 - Registration: Static (compile-time) or dynamic (`register("myfilter", MyFilter)`).
 - Hierarchical: A whole subgraph can act as a Component.
@@ -238,8 +240,36 @@ stateDiagram-v2
 - Supports:
   - Fluent builder API.
   - JSON serialization (standard FBP graph format).
-  - Hierarchical subgraphs.
+  - Hierarchical subgraphs (see §2.5.1).
   - Introspection and runtime modification (add/remove nodes/edges while running where supported).
+
+#### 2.5.1 Subgraphs
+
+A subgraph is a complete graph that acts as a component in a parent graph. Its internal
+components and connections are invisible to the parent — it is addressed only through its
+exposed ports.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#909090', 'secondaryColor': '#808080', 'tertiaryColor': '#707070', 'primaryTextColor': '#000000', 'secondaryTextColor': '#000000', 'tertiaryTextColor': '#000000', 'noteTextColor': '#000000', 'lineColor': '#404040' }}}%%
+graph LR
+    subgraph Parent
+        SRC[Source]
+        subgraph "NormClamp — subgraph"
+            NORM[Normalise] --> CLAMP[Clamp]
+        end
+        SINK[Sink]
+        ESINK[ErrorSink]
+    end
+    SRC -->|"value → in_value"| NORM
+    SRC -->|"scale → in_scale"| NORM
+    CLAMP -->|"out → out_result"| SINK
+    CLAMP -->|"over → out_overflow"| ESINK
+```
+
+- Subgraphs can have **multiple exposed inports and outports** — any number.
+- `setup`/`teardown` propagate recursively.
+- Back-pressure flows through exposed port boundaries as normal.
+- Nesting is unlimited.
 
 ### 2.6 Scheduler / Engine
 
@@ -423,7 +453,13 @@ sequenceDiagram
 
 ---
 
-## 6. API Sketches (Idiomatic per Language)
+## 6. API
+
+The full C ABI-compatible API is documented in [`docs/api.md`](./docs/api.md) (concepts,
+mermaid diagrams, and examples) and [`docs/api-reference.md`](./docs/api-reference.md)
+(complete function and struct reference).
+
+## 6a. API Sketches (Idiomatic per Language)
 
 ### C++ (Header-only friendly)
 
